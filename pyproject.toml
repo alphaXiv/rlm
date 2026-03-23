@@ -27,6 +27,9 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "requests>=2.32.5",
     "rich>=13.0.0",
+    "datasets",
+    "transformers",
+    "jinja2",
 ]
 
 [project.urls]

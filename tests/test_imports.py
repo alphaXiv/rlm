@@ -220,6 +220,7 @@ class TestUtilsImports:
     def test_parsing_import(self):
         """Test parsing module import."""
         from rlm.utils.parsing import (
+            ensure_think_wrapped,
             find_code_blocks,
             find_final_answer,
             format_execution_result,
@@ -230,6 +231,7 @@ class TestUtilsImports:
         assert callable(find_final_answer)
         assert callable(format_iteration)
         assert callable(format_execution_result)
+        assert callable(ensure_think_wrapped)
 
     def test_prompts_import(self):
         """Test prompts module import."""

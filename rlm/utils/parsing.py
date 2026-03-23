@@ -11,11 +11,46 @@ if TYPE_CHECKING:
     from rlm.environments.base_env import BaseEnv
 
 
+_THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL)
+_LEADING_THINK_RE = re.compile(
+    r"^<think(?:ing)?>\s*(.*?)\s*</think(?:ing)?>\s*", re.DOTALL
+)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove ``<think>``/``<thinking>`` blocks from *text*."""
+    return _THINK_RE.sub("", text).strip()
+
+
+def _is_qwen35(model_name: str | None) -> bool:
+    """Return ``True`` when *model_name* refers to a Qwen 3.5 variant."""
+    if not model_name:
+        return False
+    return "qwen3.5" in model_name.lower()
+
+
+def ensure_think_wrapped(text: str) -> str:
+    """Ensure *text* starts with ``<think>\\n...\\n</think>\\n\\n``.
+
+    If *text* already opens with a ``<think>``/``<thinking>`` block the
+    formatting is normalised.  Otherwise an empty block is prepended.
+    """
+    match = _LEADING_THINK_RE.match(text)
+    if match:
+        thinking_content = match.group(1)
+        rest = text[match.end():]
+        if thinking_content:
+            return f"<think>\n{thinking_content}\n</think>\n\n{rest}"
+        return f"<think>\n</think>\n\n{rest}"
+    return f"<think>\n</think>\n\n{text}"
+
+
 def find_code_blocks(text: str) -> list[str]:
     """
     Find REPL code blocks in text wrapped in triple backticks and return List of content(s).
     Returns None if no code blocks are found.
     """
+    text = strip_thinking(text)
     pattern = r"```repl\s*\n(.*?)\n```"
     results = []
 
@@ -40,6 +75,8 @@ def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | 
     Returns:
         The final answer string, or None if no final answer pattern is found
     """
+    text = strip_thinking(text)
+
     # Check for FINAL_VAR pattern first - must be at start of line
     final_var_pattern = r"^\s*FINAL_VAR\((.*?)\)"
     match = re.search(final_var_pattern, text, re.MULTILINE | re.DOTALL)
@@ -71,21 +108,32 @@ def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | 
 
 
 def format_iteration(
-    iteration: RLMIteration, max_character_length: int = 20000
+    iteration: RLMIteration,
+    max_character_length: int = 20000,
+    model_name: str | None = None,
 ) -> list[dict[str, str]]:
     """
     Format an RLM iteration (including all code blocks) to append to the message history for
     the prompt of the LM in the next iteration. We also truncate code execution results
     that exceed the max_character_length.
 
+    For Qwen 3.5 models the assistant content preserves the thinking trace in
+    ``<think>\\n...\\n</think>\\n\\n`` format (empty block when no thinking).
+
     Args:
         iteration: The iteration to format
         max_character_length: The maximum character length of the result
+        model_name: Model identifier; used to decide Qwen 3.5 formatting.
 
     Returns:
         A list of messages to add to the next prompt
     """
-    messages = [{"role": "assistant", "content": iteration.response}]
+    if _is_qwen35(model_name):
+        content = ensure_think_wrapped(iteration.response)
+    else:
+        content = strip_thinking(iteration.response)
+
+    messages = [{"role": "assistant", "content": content}]
 
     for code_block in iteration.code_blocks:
         code = code_block.code

@@ -397,7 +397,12 @@ class RLM:
                         )
 
                     # Format the iteration for the next prompt.
-                    new_messages = format_iteration(iteration)
+                    model_name = (
+                        self.backend_kwargs.get("model_name")
+                        if self.backend_kwargs
+                        else None
+                    )
+                    new_messages = format_iteration(iteration, model_name=model_name)
 
                     # Update message history with the new messages.
                     message_history.extend(new_messages)

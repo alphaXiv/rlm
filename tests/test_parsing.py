@@ -6,6 +6,7 @@ from rlm.core.types import CodeBlock, REPLResult, RLMIteration
 from rlm.environments.local_repl import LocalREPL
 from rlm.utils.parsing import (
     convert_context_for_repl,
+    ensure_think_wrapped,
     find_code_blocks,
     find_final_answer,
     format_execution_result,
@@ -348,6 +349,81 @@ class TestFormatIteration:
         messages = format_iteration(iteration, max_character_length=100)
         # Result should be truncated
         assert len(messages[1]["content"]) < 30000
+
+
+class TestEnsureThinkWrapped:
+    """Tests for ensure_think_wrapped function."""
+
+    def test_plain_text_gets_empty_think_block(self):
+        result = ensure_think_wrapped("Hello world")
+        assert result == "<think>\n</think>\n\nHello world"
+
+    def test_existing_think_block_normalised(self):
+        text = "<think>\nsome reasoning\n</think>\n\ncontent"
+        result = ensure_think_wrapped(text)
+        assert result == "<think>\nsome reasoning\n</think>\n\ncontent"
+
+    def test_thinking_tag_normalised_to_think(self):
+        text = "<thinking>\nsome reasoning\n</thinking>\n\ncontent"
+        result = ensure_think_wrapped(text)
+        assert result == "<think>\nsome reasoning\n</think>\n\ncontent"
+
+    def test_empty_think_block_normalised(self):
+        text = "<think></think>content"
+        result = ensure_think_wrapped(text)
+        assert result == "<think>\n</think>\n\ncontent"
+
+    def test_multiline_reasoning(self):
+        text = "<think>\nline1\nline2\nline3\n</think>\n\nfinal answer"
+        result = ensure_think_wrapped(text)
+        assert result.startswith("<think>\n")
+        assert "line1\nline2\nline3" in result
+        assert result.endswith("</think>\n\nfinal answer")
+
+    def test_empty_string(self):
+        result = ensure_think_wrapped("")
+        assert result == "<think>\n</think>\n\n"
+
+
+class TestFormatIterationQwen35:
+    """Tests for format_iteration with Qwen 3.5 model_name."""
+
+    def test_qwen35_wraps_plain_response(self):
+        iteration = RLMIteration(
+            prompt="test",
+            response="Hello",
+            code_blocks=[],
+        )
+        messages = format_iteration(iteration, model_name="Qwen/Qwen3.5-397B-A17B")
+        assert messages[0]["content"] == "<think>\n</think>\n\nHello"
+
+    def test_qwen35_preserves_reasoning(self):
+        iteration = RLMIteration(
+            prompt="test",
+            response="<think>\nreasoning here\n</think>\n\ncontent",
+            code_blocks=[],
+        )
+        messages = format_iteration(iteration, model_name="Qwen/Qwen3.5-397B-A17B")
+        assert messages[0]["content"].startswith("<think>\nreasoning here\n</think>\n\n")
+        assert "content" in messages[0]["content"]
+
+    def test_non_qwen_strips_thinking(self):
+        iteration = RLMIteration(
+            prompt="test",
+            response="<think>\nreasoning\n</think>\n\ncontent",
+            code_blocks=[],
+        )
+        messages = format_iteration(iteration, model_name="openai/gpt-4o")
+        assert messages[0]["content"] == "content"
+
+    def test_no_model_name_strips_thinking(self):
+        iteration = RLMIteration(
+            prompt="test",
+            response="<think>\nreasoning\n</think>\n\ncontent",
+            code_blocks=[],
+        )
+        messages = format_iteration(iteration)
+        assert messages[0]["content"] == "content"
 
 
 class TestConvertContextForRepl:

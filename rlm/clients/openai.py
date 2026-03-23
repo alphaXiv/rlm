@@ -25,6 +25,11 @@ class OpenAIClient(BaseLM):
     Any additional keyword arguments (e.g. default_headers, default_query, max_retries)
     are passed through to the underlying openai.OpenAI and openai.AsyncOpenAI constructors.
     Only model_name is excluded, since it is not a client constructor argument.
+
+    Optional ``sampling_params`` are passed as keyword arguments to ``chat.completions.create``
+    (e.g. ``temperature``, ``top_p``, ``presence_penalty``). Optional ``sampling_extra_body``
+    is merged into ``extra_body`` before ``completion_extra_body`` (for fields the SDK does
+    not surface, e.g. ``top_k``, ``min_p``, ``repetition_penalty``).
     """
 
     def __init__(
@@ -35,6 +40,15 @@ class OpenAIClient(BaseLM):
         **kwargs,
     ):
         super().__init__(model_name=model_name, **kwargs)
+
+        # Merged into chat.completions.create(..., extra_body=...) — not an OpenAI() client kwarg.
+        self.completion_extra_body: dict[str, Any] = dict(
+            self.kwargs.pop("completion_extra_body", None) or {}
+        )
+        self.sampling_params: dict[str, Any] = dict(self.kwargs.pop("sampling_params", None) or {})
+        self.sampling_extra_body: dict[str, Any] = dict(
+            self.kwargs.pop("sampling_extra_body", None) or {}
+        )
 
         if api_key is None:
             if base_url == "https://api.openai.com/v1" or base_url is None:
@@ -66,6 +80,33 @@ class OpenAIClient(BaseLM):
         self.model_total_tokens: dict[str, int] = defaultdict(int)
         self.model_costs: dict[str, float] = defaultdict(float)  # Cost in USD
 
+    def _build_response_with_reasoning(self, message) -> str:
+        """Reconstruct full model output including any reasoning/thinking content.
+
+        Providers like OpenRouter separate thinking tokens into a dedicated field
+        (``reasoning`` or ``reasoning_content``) on the message.  Re-wrapping them
+        in ``<think>`` tags reproduces the raw model output that SFT pipelines need.
+        """
+        content = message.content or ""
+
+        reasoning: str | None = None
+        for attr in ("reasoning_content", "reasoning"):
+            value = getattr(message, attr, None)
+            if value:
+                reasoning = value
+                break
+        if reasoning is None:
+            extra = getattr(message, "model_extra", None) or {}
+            reasoning = extra.get("reasoning_content") or extra.get("reasoning") or None
+
+        if not reasoning:
+            return content
+
+        stripped = reasoning.strip()
+        if stripped.startswith("<think>") or stripped.startswith("<thinking>"):
+            return f"{reasoning}\n\n{content}" if content else reasoning
+        return f"<think>\n{reasoning}\n</think>\n\n{content}" if content else f"<think>\n{reasoning}\n</think>"
+
     def completion(self, prompt: str | list[dict[str, Any]], model: str | None = None) -> str:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
@@ -78,15 +119,22 @@ class OpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for OpenAI client.")
 
-        extra_body = {}
+        extra_body: dict[str, Any] = {}
         if self.client.base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
             extra_body["usage"] = {"include": True}
+        extra_body.update(self.sampling_extra_body)
+        extra_body.update(self.completion_extra_body)
+
+        create_kwargs = dict(self.sampling_params)
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
 
         response = self.client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model, messages=messages, **create_kwargs
         )
+        msg = response.choices[0].message
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        return self._build_response_with_reasoning(msg)
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -102,15 +150,21 @@ class OpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for OpenAI client.")
 
-        extra_body = {}
+        extra_body: dict[str, Any] = {}
         if self.client.base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
             extra_body["usage"] = {"include": True}
+        extra_body.update(self.sampling_extra_body)
+        extra_body.update(self.completion_extra_body)
+
+        create_kwargs = dict(self.sampling_params)
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
 
         response = await self.async_client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model, messages=messages, **create_kwargs
         )
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        return self._build_response_with_reasoning(response.choices[0].message)
 
     def _track_cost(self, response: openai.ChatCompletion, model: str):
         self.model_call_counts[model] += 1
