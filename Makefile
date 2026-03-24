@@ -37,6 +37,9 @@ run-all: quickstart docker-repl lm-repl modal-repl
 quickstart: install
 	uv run python -m examples.quickstart
 
+eval: install
+  	uv run python -m examples.eval
+
 docker-repl: install
 	uv run python -m examples.docker_repl_example
 
