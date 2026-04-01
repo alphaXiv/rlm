@@ -61,6 +61,7 @@ class RLM:
         max_tokens: int | None = None,
         max_errors: int | None = None,
         custom_system_prompt: str | None = None,
+        custom_child_system_prompt: str | None = None,
         other_backends: list[ClientBackend] | None = None,
         other_backend_kwargs: list[dict[str, Any]] | None = None,
         logger: RLMLogger | None = None,
@@ -90,6 +91,8 @@ class RLM:
             max_tokens: Maximum total tokens (input + output). Execution stops if exceeded, returning best answer if available.
             max_errors: Maximum consecutive errors before stopping. Execution stops if exceeded, returning best answer if available.
             custom_system_prompt: The custom system prompt to use for the RLM.
+            custom_child_system_prompt: System prompt for child RLMs spawned via rlm_query/rlm_query_batched.
+                If None, children inherit the parent's system prompt.
             other_backends: A list of other client backends that the environments can use to make sub-calls.
             other_backend_kwargs: The kwargs to pass to the other client backends (ordered to match other_backends).
             logger: The logger to use for the RLM.
@@ -145,6 +148,7 @@ class RLM:
         self.max_tokens = max_tokens
         self.max_errors = max_errors
         self.system_prompt = custom_system_prompt if custom_system_prompt else RLM_SYSTEM_PROMPT
+        self.child_system_prompt = custom_child_system_prompt
         self.logger = logger
         self.verbose = VerbosePrinter(enabled=verbose)
 
@@ -607,9 +611,11 @@ class RLM:
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
-        for code_block_str in code_block_strs:
-            code_result: REPLResult = environment.execute_code(code_block_str)
-            code_blocks.append(CodeBlock(code=code_block_str, result=code_result))
+        # Only execute the first code block — subsequent blocks are
+        # self-corrections / retries that the model emitted mid-generation.
+        if code_block_strs:
+            code_result: REPLResult = environment.execute_code(code_block_strs[0])
+            code_blocks.append(CodeBlock(code=code_block_strs[0], result=code_result))
 
         iteration_time = time.perf_counter() - iter_start
         return RLMIteration(
@@ -652,7 +658,12 @@ class RLM:
         response = client.completion(message)
         return response
 
-    def _subcall(self, prompt: str, model: str | None = None) -> RLMChatCompletion:
+    def _subcall(
+        self,
+        prompt: str,
+        model: str | None = None,
+        context: str | dict | list | None = None,
+    ) -> RLMChatCompletion:
         """
         Handle a subcall from the environment, potentially spawning a child RLM.
 
@@ -661,9 +672,13 @@ class RLM:
         it falls back to a plain LM completion.
 
         Args:
-            prompt: The prompt to process.
+            prompt: The prompt / instructions to process.
             model: Optional model name. If specified, the child RLM will use this model
                 instead of inheriting the parent's default backend.
+            context: Optional context payload for the child RLM. When provided, this
+                becomes the child's ``context`` REPL variable (first arg to
+                ``completion``) and *prompt* is used as the child's ``root_prompt``.
+                When ``None``, *prompt* is passed as the context (legacy behaviour).
 
         Returns:
             The full RLMChatCompletion from either a child RLM or plain LM completion.
@@ -753,12 +768,14 @@ class RLM:
         subcall_start = time.perf_counter()
         error_msg: str | None = None
 
+        child_env_kwargs = self.environment_kwargs.copy() if self.environment_kwargs else {}
+
         # Spawn a child RLM with its own LocalREPL
         child = RLM(
             backend=self.backend,
             backend_kwargs=child_backend_kwargs,
             environment=self.environment_type,
-            environment_kwargs=self.environment_kwargs,
+            environment_kwargs=child_env_kwargs,
             depth=next_depth,
             max_depth=self.max_depth,
             max_iterations=self.max_iterations,
@@ -766,7 +783,7 @@ class RLM:
             max_timeout=remaining_timeout,
             max_tokens=self.max_tokens,
             max_errors=self.max_errors,
-            custom_system_prompt=self.system_prompt,
+            custom_system_prompt=self.child_system_prompt or self.system_prompt,
             other_backends=self.other_backends,
             other_backend_kwargs=self.other_backend_kwargs,
             # Give child its own logger so its trajectory is captured in metadata
@@ -782,7 +799,17 @@ class RLM:
             on_subcall_complete=self.on_subcall_complete,
         )
         try:
-            result = child.completion(prompt, root_prompt=None)
+            # Determine what the child sees as context vs root_prompt.
+            # When the caller supplies an explicit *context*, it becomes the
+            # child's ``context`` REPL variable and *prompt* is the root_prompt.
+            # Otherwise fall back to legacy behaviour (prompt = context).
+            if context is not None:
+                child_context = context
+                child_root_prompt = prompt
+            else:
+                child_context = prompt
+                child_root_prompt = None
+            result = child.completion(child_context, root_prompt=child_root_prompt)
             # Track child's cost in parent's cumulative cost
             if result.usage_summary and result.usage_summary.total_cost:
                 self._cumulative_cost += result.usage_summary.total_cost

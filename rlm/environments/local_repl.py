@@ -1,3 +1,4 @@
+import ast
 import copy
 import io
 import json
@@ -132,7 +133,11 @@ class LocalREPL(NonIsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
-        subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        subcall_fn: Callable[
+            [str, str | None, str | dict | list | None],
+            RLMChatCompletion,
+        ]
+        | None = None,
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
@@ -300,7 +305,26 @@ class LocalREPL(NonIsolatedEnv):
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
 
-    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+    @staticmethod
+    def _parse_child_response(response: str) -> Any:
+        """Try to parse a child's string response back into a Python object.
+
+        When a child calls FINAL_VAR on a list/dict, it gets str()-ified for the
+        RLMChatCompletion.response field.  This method recovers the original object
+        so that the parent REPL receives an actual list/dict, not a string repr.
+        Falls back to returning the raw string if parsing fails.
+        """
+        try:
+            return ast.literal_eval(response)
+        except Exception:
+            return response
+
+    def _rlm_query(
+        self,
+        prompt: str,
+        model: str | None = None,
+        context: str | dict | list | None = None,
+    ) -> Any:
         """Spawn a recursive RLM sub-call for deeper thinking on a subtask.
 
         When a subcall callback is available (max_depth > 1), this spawns a child
@@ -310,19 +334,27 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompt: The prompt to send to the child RLM.
             model: Optional model name override for the child.
+            context: Optional context payload for the child. When provided, this becomes
+                the child's ``context`` REPL variable and *prompt* is passed as the
+                child's ``root_prompt`` so the framework messages are consistent.
         """
         if self.subcall_fn is not None:
             try:
-                completion = self.subcall_fn(prompt, model)
+                completion = self.subcall_fn(prompt, model, context)
                 self._pending_llm_calls.append(completion)
-                return completion.response
+                return self._parse_child_response(completion.response)
             except Exception as e:
                 return f"Error: RLM query failed - {e}"
 
         # Fall back to plain LM call if no recursive capability
         return self._llm_query(prompt, model)
 
-    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+    def _rlm_query_batched(
+        self,
+        prompts: list[str],
+        model: str | None = None,
+        context_list: list[str | dict | list | None] | None = None,
+    ) -> list[Any]:
         """Spawn recursive RLM sub-calls for multiple prompts in parallel.
 
         Each prompt gets its own child RLM for deeper thinking. When multiple
@@ -335,19 +367,25 @@ class LocalREPL(NonIsolatedEnv):
         Args:
             prompts: List of prompts for child RLMs.
             model: Optional model name override for the children.
+            context_list: Optional list of context payloads, one per prompt.
+                When an entry is not None it becomes the child's ``context`` REPL
+                variable and the corresponding prompt is passed as ``root_prompt``.
 
         Returns:
-            List of responses in the same order as input prompts.
+            List of parsed responses in the same order as input prompts.
+            If a child returns a Python literal (list, dict, etc.) via FINAL_VAR,
+            it is returned as the actual object, not a string.
         """
+        ctx_list = context_list or [None] * len(prompts)
         if self.subcall_fn is not None:
             # For 0 or 1 prompts, no need for thread pool overhead
             if len(prompts) <= 1:
                 results = []
-                for prompt in prompts:
+                for prompt, ctx in zip(prompts, ctx_list):
                     try:
-                        completion = self.subcall_fn(prompt, model)
+                        completion = self.subcall_fn(prompt, model, ctx)
                         self._pending_llm_calls.append(completion)
-                        results.append(completion.response)
+                        results.append(self._parse_child_response(completion.response))
                     except Exception as e:
                         results.append(f"Error: RLM query failed - {e}")
                 return results
@@ -355,22 +393,27 @@ class LocalREPL(NonIsolatedEnv):
             # Parallel execution for multiple prompts
             max_workers = min(self.max_concurrent_subcalls, len(prompts))
             # Pre-allocate result slots to preserve ordering
-            results: list[str] = [""] * len(prompts)
+            results: list[Any] = [None] * len(prompts)
             completions: list[tuple[int, RLMChatCompletion]] = []
             lock = threading.Lock()
 
-            def _run_subcall(index: int, prompt: str) -> None:
+            def _run_subcall(
+                index: int,
+                prompt: str,
+                ctx: str | dict | list | None,
+            ) -> None:
                 try:
-                    completion = self.subcall_fn(prompt, model)
+                    completion = self.subcall_fn(prompt, model, ctx)
                     with lock:
                         completions.append((index, completion))
-                    results[index] = completion.response
+                    results[index] = self._parse_child_response(completion.response)
                 except Exception as e:
                     results[index] = f"Error: RLM query failed - {e}"
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    executor.submit(_run_subcall, i, prompt) for i, prompt in enumerate(prompts)
+                    executor.submit(_run_subcall, i, prompt, ctx)
+                    for i, (prompt, ctx) in enumerate(zip(prompts, ctx_list))
                 ]
                 # Wait for all futures to complete; exceptions are captured inside _run_subcall
                 for future in as_completed(futures):
@@ -491,16 +534,6 @@ class LocalREPL(NonIsolatedEnv):
             finally:
                 sys.stdout, sys.stderr = old_stdout, old_stderr
 
-    @contextmanager
-    def _temp_cwd(self):
-        """Temporarily change to temp directory for execution."""
-        old_cwd = os.getcwd()
-        try:
-            os.chdir(self.temp_dir)
-            yield
-        finally:
-            os.chdir(old_cwd)
-
     def _restore_scaffold(self) -> None:
         """Restore scaffold names after execution so overwrites (e.g. context = 'x') don't persist."""
         for name in RESERVED_TOOL_NAMES:
@@ -530,7 +563,7 @@ class LocalREPL(NonIsolatedEnv):
         # Clear pending LLM calls from previous execution
         self._pending_llm_calls = []
 
-        with self._capture_output() as (stdout_buf, stderr_buf), self._temp_cwd():
+        with self._capture_output() as (stdout_buf, stderr_buf):
             try:
                 combined = {**self.globals, **self.locals}
                 exec(code, combined, combined)
