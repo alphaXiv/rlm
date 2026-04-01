@@ -16,12 +16,12 @@ from rlm import RLM
 from rlm.logger import RLMLogger
 from rlm.utils.parsing import ensure_think_wrapped
 from transformers import AutoTokenizer
-from utils.evals import compute_metrics
+from utils.evals import compute_metrics_multipaper
 
 load_dotenv()
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
-_DATA = os.path.join(_ROOT, "data", "generated-queries-train.json")
+_DATA = os.path.join(_ROOT, "data", "generated-queries-sample.json")
 MAX_EXAMPLES = 1
 
 with open(_DATA) as f:
@@ -31,67 +31,95 @@ SYSTEM_PROMPT = textwrap.dedent(
     """\
 You are an evidence extraction coordinator. You find VERBATIM text from the context relevant to a query.
 
-The context has MULTIPLE papers, each starting with `### PAPER: <title>`.
+The context is a DICTIONARY where each key is a paper ID (like "2205.05212") and each value is the full text of that paper starting with `### PAPER: <title>`.
 
 REPL tools:
-- `context`: the full text of all papers.
-- `list_papers(text)` — list all papers with their index and title. Always pass `context` as first arg.
-- `search(text, keyword, window=300, max_snippets=10)` — keyword search. Always pass `context` as first arg. Output is grouped by paper with headers like `=== [Paper Index 0] ### PAPER: ... ===` so you can see which paper each snippet belongs to. Every line in each snippet is prefixed with its line number (e.g. `L42: ...`). If no exact match is found, fuzzy matching is used automatically.
-- `extract_lines(text, start_line, end_line)` — extract lines from `start_line` to `end_line` (inclusive, 1-indexed). Always pass `context` as first arg. Use line numbers from search output.
-- `extract_paper(text, start_phrase)` — extract a full paper starting at `start_phrase` until the next `### PAPER:` header. Always pass `context` as first arg. Does not print output.
-- `rlm_query_batched(prompts, context_list=None)` — dispatch child agents. Each child gets `context` = the paper text you provide. Returns list of results (each a Python list of extracted strings).
+- `context`: a dictionary where keys are paper IDs and values are full paper texts.
+- `list_papers(context)` — list all paper IDs with the first 1000 characters of their content.
+- `search(text, keyword, window=300)` — keyword search. Pass `context` to search ALL papers at once (results are grouped by paper ID and title), or pass `context[paper_id]` to search a single paper. Every line in each snippet is prefixed with its line number (e.g. `L42: ...`).
+- `extract_lines(text, start_line, end_line)` — extract lines from `start_line` to `end_line` (inclusive, 1-indexed). Pass `context[paper_id]` as first arg.
+- `get_paper_abstract(context, paper_id)` — return a formatted string with the paper ID, title, and abstract for the given paper.
+- `rlm_query_batched(prompts, context_list=None)` — dispatch child agents. Each child gets the paper text you provide. Returns list of results (each a Python list of extracted strings).
 - `FINAL_VAR(variable_name)` — return your final answer.
+
+Access individual papers directly using: `context["paper_id"]` (e.g., `context["2205.05212"]`)
 
 CRITICAL: You MUST write exactly ONE ```repl block per response. The engine ONLY executes the first block and IGNORES all others. Do NOT revise, retry, or "start fresh" with additional blocks — you will lose that code. Get it right in a single block.
 
+ABOUT THE DATASET:
+Questions fall into one of four tiers based on how many papers are involved:
+- **Wide-net**: The answer involves 5+ papers (often many more). These ask about prevalence, counting, shared patterns, or benchmark comparisons across the collection.
+- **Mid-range**: The answer involves 3-4 papers. These ask about methodology clusters, numerical comparisons, or consensus vs. outlier.
+- **Focused**: The answer involves exactly 2 papers. Head-to-head comparisons, contradictions, or methodology differences.
+- **Singleton**: The answer comes from a single paper only. Specific results, ablation findings, or methodology details.
+
+You must gauge the tier from the query. Wide-net and mid-range questions are common — for these you need to be GENEROUS about which papers you assign to child agents. When in doubt, include more papers rather than fewer. For wide-net questions, it is normal to dispatch 10-20+ papers. Missing a relevant paper is a much worse failure than including an irrelevant one (the child will simply return an empty list).
+
 STRATEGY (follow exactly):
 
-**Turn 1**: List all papers and search for keywords relevant to the query. This lets you see which papers exist and which contain relevant content.
+**Turn 1**: List all papers and search the full context with your primary keywords.
 ```repl
-papers = list_papers(context)
-hits = search(context, "<QUERY_KEYWORD>", window=300, max_snippets=15)
+paper_list = list_papers(context)
+hits1 = search(context, "<QUERY_KEYWORD>", window=300)
+hits2 = search(context, "<SYNONYM_OR_RELATED_TERM>", window=300)
 ```
-`list_papers` prints each paper's index and title. The keyword search output shows `[Paper Index N]` headers so you can see which papers have hits. Each line is prefixed with its line number.
+`list_papers()` shows each paper ID with content preview. `search(context, ...)` searches all papers at once and groups results by paper ID — use this to quickly identify which papers are relevant.
 
-**Turn 2+**: Use `extract_paper` to slice each relevant paper and dispatch child agents. Pass the paper title from the headers search as the start_phrase. Write a focused query for each paper — ask about THAT paper specifically, not the full cross-paper question. Include the first 1000 chars of the paper in the query so the child knows what paper it's working with.
+*(code runs, you receive the output)*
 
-IMPORTANT: Only batch UP TO 4 papers per `rlm_query_batched` call. If you have more than 4 papers, split across multiple turns (4 at a time).
+**Turn 2**: Search with additional keywords to catch papers the first search missed.
 ```repl
-paper_a = extract_paper(context, "### PAPER: <Title of Paper A>")
-paper_b = extract_paper(context, "### PAPER: <Title of Paper B>")
-paper_c = extract_paper(context, "### PAPER: <Title of Paper C>")
-paper_d = extract_paper(context, "### PAPER: <Title of Paper D>")
-slices = [paper_a, paper_b, paper_c, paper_d]
-prompts = [
-    "<QUERY focused on Paper A>\n\nPaper preview:\n" + paper_a[:1000],
-    "<QUERY focused on Paper B>\n\nPaper preview:\n" + paper_b[:1000],
-    "<QUERY focused on Paper C>\n\nPaper preview:\n" + paper_c[:1000],
-    "<QUERY focused on Paper D>\n\nPaper preview:\n" + paper_d[:1000],
+hits3 = search(context, "<ANOTHER_ANGLE>", window=300)
+hits4 = search(context, "<ABBREVIATION_OR_VARIANT>", window=300)
+```
+After this turn, compile the full list of relevant paper IDs from ALL searches so far. For targeted follow-up on a specific paper, use `search(context[paper_id], keyword)`. For wide-net questions, err on the side of including MORE papers.
+
+*(code runs, you receive the output)*
+
+**Turn 3+**: Get relevant papers and dispatch child agents via `rlm_query_batched`.
+
+IMPORTANT: `rlm_query_batched` processes AT MOST 4 papers per call. If you have more papers, you MUST split them across multiple calls (4 at a time). For wide-net questions with 12+ relevant papers, that means 3-4 calls across multiple turns — plan your turn budget accordingly.
+
+Write a focused query for each paper — ask about THAT paper specifically, not the full cross-paper question. CRITICAL: You MUST call `get_paper_abstract(context, paper_id)` to append the paper's title and abstract to EVERY prompt. Never pass a bare string — always concatenate the result of `get_paper_abstract`. This is mandatory so the child agent knows which paper it is working with.
+```repl
+ids1 = ["2205.05212", "1234.5678", "9876.5432", "1111.2222"]
+papers1 = [context[pid] for pid in ids1]
+prompts1 = [
+    f"<QUERY focused on paper {{ids1[0]}}>\\n\\nPaper preview:\\n" + get_paper_abstract(context, ids1[0]),
+    f"<QUERY focused on paper {{ids1[1]}}>\\n\\nPaper preview:\\n" + get_paper_abstract(context, ids1[1]),
+    f"<QUERY focused on paper {{ids1[2]}}>\\n\\nPaper preview:\\n" + get_paper_abstract(context, ids1[2]),
+    f"<QUERY focused on paper {{ids1[3]}}>\\n\\nPaper preview:\\n" + get_paper_abstract(context, ids1[3]),
 ]
-results1 = rlm_query_batched(prompts, context_list=slices)
-print(results1)
+results1 = rlm_query_batched(prompts1, context_list=papers1)
 ```
-Then in the next turn, do the next batch of up to 4, and so on.
+Then in the next turn, do the next batch of 4 (using `ids2`, `papers2`, `prompts2`, `results2`), and so on until ALL relevant papers are covered. Keep the `idsN` list in sync with `resultsN` — you'll need them together in the final turn.
 
-**Final turn**: Flatten all results and return. Do NOT filter or verify — just collect and return.
+*(code runs, you receive the output)*
+
+**Final turn**: Pair each result with its paper ID and return a list of (paper_id, evidence) tuples. Do NOT filter or verify.
 ```repl
 evidence = []
-for r in results1 + results2:
+for paper_id, r in zip(ids1, results1):
     if isinstance(r, list):
-        evidence.extend(r)
-    elif isinstance(r, str) and len(r) > 100:
-        evidence.append(r)
+        for item in r:
+            evidence.append((paper_id, item))
+for paper_id, r in zip(ids2, results2):
+    if isinstance(r, list):
+        for item in r:
+            evidence.append((paper_id, item))
 FINAL_VAR("evidence")
 ```
 
 RULES:
+- You have a HARD LIMIT of 10 rounds total. Plan accordingly — spend 2-4 turns searching, then dispatch.
 - EXACTLY ONE ```repl block per response. Never two, never zero (unless returning final answer without code).
 - No `#` comments in REPL code.
 - For 2+ papers: ALWAYS use `rlm_query_batched`. Never extract evidence yourself.
-- MAX 4 papers per `rlm_query_batched` call. Split into multiple turns if needed.
+- `rlm_query_batched` takes MAX 4 papers per call. Split into multiple turns of 4 if you have more papers.
+- Each prompt passed to `rlm_query_batched` MUST end with `+ get_paper_abstract(context, paper_id)`. Never pass a plain string without it.
+- For wide-net questions: dispatch ALL plausibly relevant papers (even 5+). That means multiple batches of 4 across several turns. Missing a relevant paper is far worse than including an irrelevant one (the child will just return an empty list).
 - Do NOT verify or filter child results. Just flatten and return them directly.
 - Final answer = list of VERBATIM substrings from context.
-- Include ALL papers mentioned in the query.
 """
 )
 
@@ -101,7 +129,7 @@ You are a PRECISE evidence extraction worker. You have a single paper in `contex
 
 REPL tools:
 - `context`: full text of your paper.
-- `search(text, keyword, window=300, max_snippets=10)` — keyword search. Always pass `context` as first arg. \
+- `search(text, keyword, window=300)` — keyword search. Always pass `context` as first arg. \
 Every line in each snippet is prefixed with its line number (e.g. `L42: ...`). If no exact match is found, fuzzy matching is used automatically.
 - `extract_lines(text, start_line, end_line)` — extract lines from `start_line` to `end_line` (inclusive, 1-indexed). \
 Always pass `context` as first arg. Returns the verbatim text (without line number prefixes). \
@@ -160,32 +188,40 @@ line numbers to return the full paragraph that contains the evidence. Prefer ret
 
 Here is the expected procedure (5-7 responses, NEVER fewer than 5 unless the paper is clearly irrelevant):
 
-Response 1 — initial broad search with 2-3 keywords:
+Turn 1 — initial broad search with 2-3 keywords:
 ```repl
-s1 = search(context, "keyword1", window=400, max_snippets=15)
-s2 = search(context, "keyword2", window=400, max_snippets=15)
+s1 = search(context, "keyword1", window=400)
+s2 = search(context, "keyword2", window=400)
 ```
 
-Response 2 — search with DIFFERENT keywords to find passages the first search missed:
+*(code runs, you receive the output)*
+
+Turn 2 — search with DIFFERENT keywords to find passages the first search missed:
 ```repl
-s3 = search(context, "synonym_or_related_term", window=400, max_snippets=15)
-s4 = search(context, "another_angle", window=400, max_snippets=15)
+s3 = search(context, "synonym_or_related_term", window=400)
+s4 = search(context, "another_angle", window=400)
 ```
 
-Response 3 — expand the most promising snippets from ALL prior searches:
+*(code runs, you receive the output)*
+
+Turn 3 — expand the most promising snippets from ALL prior searches:
 ```repl
 e1 = search(context, s1[0], window=1200, bidirectional=False)
 e2 = search(context, s2[3], window=1200, bidirectional=False)
 e3 = search(context, s3[1], window=1200, bidirectional=False)
 ```
 
-Response 4 — now you have full context; extract the best paragraph(s) by line number:
+*(code runs, you receive the output)*
+
+Turn 4 — now you have full context; extract the best paragraph(s) by line number:
 ```repl
 p1 = extract_lines(context, 142, 155)
 p2 = extract_lines(context, 310, 322)
 ```
 
-Response 5 — verify the extractions look correct, then return:
+*(code runs, you receive the output)*
+
+Turn 5 — verify the extractions look correct, then return:
 ```repl
 FINAL_VAR([p1, p2])
 ```
@@ -213,138 +249,39 @@ os.makedirs("exports/results", exist_ok=True)
 
 
 def make_tools():
-    """Build search/extract tools that operate on a caller-provided text string."""
+    """Build search/extract tools for dictionary-based paper context."""
 
-    def _merge(text: str, items: list[tuple[int, str]]) -> list[tuple[int, str]]:
-        if not items:
-            return []
-        intervals = sorted([(s, s + len(t)) for s, t in items])
-        merged = [intervals[0]]
-        for s, e in intervals[1:]:
-            if s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
-        return [(s, text[s:e]) for s, e in merged]
-
-    def _find_paper_boundaries(text: str) -> list[tuple[int, str]]:
-        """Return sorted list of (start_index, title) for each ### PAPER: header."""
-        boundaries = []
-        for m in re.finditer(r"### PAPER:\s*(.+)", text):
-            boundaries.append((m.start(), m.group(0).strip()))
-        return sorted(boundaries, key=lambda x: x[0])
-
-    def _paper_for_position(boundaries: list[tuple[int, str]], pos: int) -> tuple[int, str]:
-        """Return (paper_index, title) for a character position."""
-        paper_idx = -1
-        title = "(before any paper)"
-        for i, (start, t) in enumerate(boundaries):
-            if pos >= start:
-                paper_idx = i
-                title = t
-            else:
-                break
-        return paper_idx, title
-
-    def _char_to_line(text: str, char_pos: int) -> int:
-        """Convert a character position to a 1-indexed line number."""
-        return text[:char_pos].count("\n") + 1
-
-    def _add_line_numbers(text: str, snippet: str, char_start: int) -> str:
-        """Prefix each line of snippet with its line number in the full text."""
-        start_line = text[:char_start].count("\n") + 1
-        lines = snippet.split("\n")
-        numbered = []
-        for i, line in enumerate(lines):
-            numbered.append(f"L{start_line + i}: {line}")
-        return "\n".join(numbered)
-
-    def _normalize_for_fuzzy(s: str) -> str:
-        """Collapse whitespace, hyphens, and newlines for fuzzy comparison."""
-        s = re.sub(r"[\s\-\u2010\u2011\u2012\u2013\u2014]+", " ", s)
-        return s.strip().lower()
-
-    def _fuzzy_search(text: str, query: str, window: int, max_snippets: int) -> list[tuple[int, str]]:
-        """Slide a window across the text and find best fuzzy matches for query."""
-        norm_query = _normalize_for_fuzzy(query)
-        query_len = len(norm_query)
-        if query_len == 0:
-            return []
-
-        char_window = max(len(query) * 2, 200)
-        step = max(char_window // 4, 50)
-
-        scored: list[tuple[float, int]] = []
-        for i in range(0, max(1, len(text) - char_window + 1), step):
-            chunk = text[i : i + char_window]
-            norm_chunk = _normalize_for_fuzzy(chunk)
-            score = fuzz.partial_ratio(norm_query, norm_chunk)
-            if score >= 65:
-                scored.append((score, i))
-
-        scored.sort(key=lambda x: -x[0])
-
-        results = []
-        used_ranges: list[tuple[int, int]] = []
-        for score, pos in scored:
-            if len(results) >= max_snippets:
-                break
-            overlaps = False
-            for us, ue in used_ranges:
-                if not (pos + char_window <= us or pos >= ue):
-                    overlaps = True
-                    break
-            if overlaps:
-                continue
-
-            left = max(0, pos - window // 4)
-            right = min(len(text), pos + char_window + window // 4)
-            while left > 0 and text[left - 1] not in ".!?\n":
-                left -= 1
-                if pos - left > window:
-                    break
-            while right < len(text) and text[right] not in ".!?\n":
-                right += 1
-                if right - pos - char_window > window:
-                    break
-            if right < len(text) and text[right] in ".!?\n":
-                right += 1
-            results.append((left, text[left:right]))
-            used_ranges.append((left, right))
-
-        return results
-
-    def list_papers(text: str) -> list[str]:
-        """List all papers in the context with their index and title."""
-        boundaries = _find_paper_boundaries(text)
+    def list_papers(ctx: dict) -> list[str]:
+        """List all paper IDs with title and abstract."""
+        print(f"Found {len(ctx)} papers:")
         titles = []
-        for i, (_start, title) in enumerate(boundaries):
-            line_no = _char_to_line(text, _start)
-            print(f"[Paper Index {i}] (L{line_no}) {title}")
+        for paper_id, content in ctx.items():
+            lines = content.split('\n')
+            title = lines[0].replace('### PAPER: ', '') if lines else "Unknown Title"
+
+            abstract_match = re.search(r'<abstract>\n(.*?)\n</abstract>', content, re.DOTALL)
+            abstract = abstract_match.group(1) if abstract_match else ""
+
+            print(f"\nPaper ID: {paper_id}")
+            print(f"Title: {title}")
+            if abstract:
+                print(f"Abstract: {abstract}")
+            print("-" * 80)
+
             titles.append(title)
-        if not boundaries:
-            print("(no papers found)")
+
         return titles
 
-    def search(
-        text: str,
-        keyword: str,
-        window: int = 300,
-        max_snippets: int = 10,
-        bidirectional: bool = True,
-    ) -> list[str]:
+    def _search_text(text: str, keyword: str, window: int) -> list[str]:
         results = []
         pattern = re.compile(re.escape(keyword), re.IGNORECASE)
         for m in pattern.finditer(text):
-            if bidirectional:
-                left = max(0, m.start() - window // 2)
-                right = min(len(text), m.end() + window // 2)
-            else:
-                left = m.start()
-                right = min(len(text), m.start() + window)
+            left = max(0, m.start() - window // 2)
+            right = min(len(text), m.end() + window // 2)
+
             while left > 0 and text[left - 1] not in ".!?\n":
                 left -= 1
-                if m.start() - left > (window if bidirectional else 100):
+                if m.start() - left > window:
                     break
             while right < len(text) and text[right] not in ".!?\n":
                 right += 1
@@ -352,68 +289,71 @@ def make_tools():
                     break
             if right < len(text) and text[right] in ".!?\n":
                 right += 1
-            results.append((left, text[left:right]))
-        merged = _merge(text, results)
 
-        used_fuzzy = False
-        if not merged:
-            merged = _fuzzy_search(text, keyword, window, max_snippets)
-            if merged:
-                used_fuzzy = True
+            snippet = text[left:right]
+            start_line = text[:left].count('\n') + 1
+            snippet_lines = snippet.split('\n')
+            numbered_lines = [f"L{start_line + i}: {line}" for i, line in enumerate(snippet_lines)]
 
-        shown = merged[:max_snippets]
-        remaining = len(merged) - len(shown)
+            idx = len(results)
+            print(f"--- snippet {idx} (L{start_line}) ---")
+            print('\n'.join(numbered_lines))
+            results.append(snippet)
 
-        boundaries = _find_paper_boundaries(text)
+        return results
 
-        if used_fuzzy:
-            print(f"(no exact hits for {keyword!r} — showing fuzzy matches)")
-
-        snippets = []
-        current_paper_idx = None
-        for start, snippet in shown:
-            pidx, ptitle = _paper_for_position(boundaries, start)
-            if pidx != current_paper_idx:
-                current_paper_idx = pidx
-                print(f"\n=== [Paper Index {pidx}] {ptitle} ===")
-            idx = len(snippets)
-            print(f"--- snippet {idx} (L{_char_to_line(text, start)}) ---")
-            print(_add_line_numbers(text, snippet, start))
-            snippets.append(snippet)
-        if not shown:
-            print(f"(no hits for {keyword!r})")
-        if remaining > 0:
-            print(f"(+{remaining} more)")
-        return snippets
+    def search(text: str | dict, keyword: str, window: int = 300) -> list[str]:
+        """Keyword search within a text string or across all papers in a dict."""
+        if isinstance(text, dict):
+            results = []
+            for paper_id, paper_text in text.items():
+                title_line = paper_text.split('\n')[0].replace('### PAPER: ', '')
+                paper_results = _search_text(paper_text, keyword, window)
+                if paper_results:
+                    print(f"\n=== Paper: {paper_id} — {title_line} ===")
+                    results.extend(paper_results)
+            if not results:
+                print(f"(no hits for {keyword!r} in any paper)")
+            return results
+        else:
+            results = _search_text(text, keyword, window)
+            if not results:
+                print(f"(no hits for {keyword!r})")
+            return results
 
     def extract_lines(text: str, start_line: int, end_line: int) -> str:
-        """Extract lines start_line..end_line (inclusive, 1-indexed) from text."""
+        """Extract lines from start_line to end_line (inclusive, 1-indexed) from a text string."""
         all_lines = text.split("\n")
         s = max(0, start_line - 1)
         e = min(len(all_lines), end_line)
         if s >= len(all_lines):
             print(f"ERROR: start_line {start_line} is beyond end of text ({len(all_lines)} lines)")
             return ""
+
         result = "\n".join(all_lines[s:e])
         if len(result) > 2000:
             print(f"WARNING: extraction is {len(result)} chars (limit 2000). Truncating. Use a tighter line range.")
             result = result[:2000]
+
+        print(f"extract_lines({start_line}, {end_line}):")
         print(result)
         return result
 
-    def extract_paper(text: str, start_phrase: str) -> str:
-        """Extract a paper from text starting at start_phrase until the next ### PAPER: header."""
-        si = text.lower().find(start_phrase.lower())
-        if si == -1:
-            si = 0
-        next_paper = re.search(r"### PAPER:", text[si + len(start_phrase):], re.IGNORECASE)
-        if next_paper:
-            result = text[si : si + len(start_phrase) + next_paper.start()]
-        else:
-            result = text[si:]
-        return result.rstrip()
+    def get_paper_abstract(ctx: dict, paper_id: str) -> str:
+        """Return a formatted string with the paper ID, title, and abstract."""
+        paper_text = ctx.get(paper_id, "")
+        lines = paper_text.split('\n')
+        title = lines[0].replace('### PAPER: ', '') if lines else "Unknown Title"
+        abstract_match = re.search(r'<abstract>\n(.*?)\n</abstract>', paper_text, re.DOTALL)
+        abstract = abstract_match.group(1) if abstract_match else ""
+        return f"Paper ID: {paper_id}\nTitle: {title}\nAbstract: {abstract}"
 
-    return {"list_papers": list_papers, "search": search, "extract_lines": extract_lines, "extract_paper": extract_paper}
+    return {
+        "list_papers": list_papers,
+        "search": search,
+        "extract_lines": extract_lines,
+        "get_paper_abstract": get_paper_abstract,
+    }
 
 
 def process_question(
@@ -421,7 +361,16 @@ def process_question(
 ) -> dict | None:
     source_id = datapoint["sourcePaperId"]
     q_text = question["question"]
-    ctx = datapoint["fullText"]
+    
+    # Create context dictionary: paperId -> "### PAPER: title\ntext"
+    ctx = {}
+    for paper in datapoint["papers"]:
+        paper_id = paper["paperId"]
+        title = paper["title"]
+        abstract = paper.get("abstract", "")
+        text = paper["text"]
+        abstract_block = f"<abstract>\n{abstract}\n</abstract>\n" if abstract else ""
+        ctx[paper_id] = f"### PAPER: {title}\n{abstract_block}{text}"
 
     query_hash = hashlib.sha256(q_text.encode()).hexdigest()[:8]
     file_stem = f"multi-{source_id}-q{question_idx}-{query_hash}"
@@ -443,16 +392,16 @@ def process_question(
         backend_kwargs={
             # openai/gpt-5.4-mini
             # anthropic/claude-sonnet-4.6
-            "model_name": "anthropic/claude-sonnet-4.6",
+            "model_name": "openai/gpt-5.4-mini",
             # **_OPENROUTER_INSTRUCT_SAMPLING,
         },
         other_backends=["openrouter"],
         other_backend_kwargs=[
-            {"model_name": "anthropic/claude-sonnet-4.6"},
+            {"model_name": "openai/gpt-5.4-mini"},
         ],
         environment="local",
         max_depth=2,
-        max_iterations=30,
+        max_iterations=10,
         custom_system_prompt=SYSTEM_PROMPT,
         custom_child_system_prompt=CHILD_SYSTEM_PROMPT,
         custom_tools=tools,
@@ -469,41 +418,47 @@ def process_question(
 
     try:
         raw = ast.literal_eval(result.response)
-        if isinstance(raw, str):
-            raw = [raw]
-        elif not isinstance(raw, list):
-            raw = [str(raw)]
+        if not isinstance(raw, list):
+            raw = []
     except (ValueError, SyntaxError):
-        raw = [s.strip() for s in result.response.split("\n\n") if s.strip()]
+        raw = []
 
-    # Flatten any nested lists (child RLMs may return lists inside the parent list)
-    substrings = []
+    # Expect list of (paper_id, evidence_text) tuples
+    pairs = []
     for item in raw:
-        if isinstance(item, list):
-            substrings.extend(str(x) for x in item)
-        else:
-            substrings.append(str(item))
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            pairs.append((str(item[0]), str(item[1])))
 
-    # Build evidence intervals from all selections across all evidence papers
-    evidence_texts = []
-    evidence_intervals = []
+    # Build evidence intervals: (paper_id, start, end) relative to each paper's text
+    evidence_data = []  # (paper_id, start, end, text)
     for ev in question["evidence"]:
         for sel in ev["selections"]:
             text = sel["text"].strip()
-            idx = ctx.find(text)
+            found_in_any = False
+            for paper_id, paper_text in ctx.items():
+                idx = paper_text.find(text)
+                if idx != -1:
+                    evidence_data.append((paper_id, idx, idx + len(text), text))
+                    found_in_any = True
+                    break
+            if not found_in_any:
+                print(f"Warning: Evidence text not found in any paper: {text[:50]}...")
+
+    # Build retrieved intervals from (paper_id, text) pairs
+    retrieved_data = []  # (paper_id, start, end, text)
+    unmatched = []
+    for pred_paper_id, s in pairs:
+        paper_text = ctx.get(pred_paper_id)
+        if paper_text is not None:
+            idx = paper_text.find(s)
             if idx != -1:
-                evidence_intervals.append((idx, idx + len(text)))
-                evidence_texts.append(text)
+                retrieved_data.append((pred_paper_id, idx, idx + len(s), s))
+                continue
+        unmatched.append((pred_paper_id, s))
 
-    retrieved_texts = []
-    retrieved_intervals = []
-    for s in substrings:
-        idx = ctx.find(s)
-        if idx != -1:
-            retrieved_intervals.append((idx, idx + len(s)))
-            retrieved_texts.append(s)
-
-    metrics = compute_metrics(retrieved_intervals, evidence_intervals)
+    evidence_intervals_mp = [(p, s, e) for p, s, e, _ in evidence_data]
+    retrieved_intervals_mp = [(p, s, e) for p, s, e, _ in retrieved_data]
+    metrics = compute_metrics_multipaper(retrieved_intervals_mp, evidence_intervals_mp)
     result_dict["eval"] = metrics
 
     full_metadata = result_dict.get("metadata", {})
@@ -552,14 +507,14 @@ def process_question(
                     f.write(child_text.rstrip("\n"))
                 child_idx += 1
 
+    # Write concatenated fulltext for backwards compatibility
+    all_papers_text = "\n\n".join(ctx.values())
     fulltext_path = os.path.join("exports/fulltext", f"{file_stem}.txt")
     with open(fulltext_path, "w") as f:
-        f.write(ctx)
+        f.write(all_papers_text)
 
     with open(metadata_path, "w") as f:
         json.dump(result_dict, f, indent=2, ensure_ascii=False)
-
-    unmatched = [s for s in substrings if ctx.find(s) == -1]
 
     results_path = os.path.join("exports/results", f"{file_stem}.txt")
     with open(results_path, "w") as rf:
@@ -570,45 +525,56 @@ def process_question(
         rf.write(f"\n{'='*80}\n")
         rf.write("GROUND TRUTH EVIDENCE\n")
         rf.write(f"{'='*80}\n")
-        for i, (interval, text) in enumerate(zip(evidence_intervals, evidence_texts)):
-            preview = text[:120].replace("\n", "\\n")
-            if len(text) > 120:
-                preview += "..."
-            rf.write(f"  [{i}] chars {interval[0]:>6}-{interval[1]:>6} ({interval[1]-interval[0]:>5} chars)  {preview}\n")
+        for i, (paper_id, start, end, text) in enumerate(evidence_data):
+            rf.write(f"  [{i}] {paper_id}  chars {start:>6}-{end:>6} ({end-start:>5} chars)\n")
+            rf.write(text + "\n\n")
 
         rf.write(f"\n{'='*80}\n")
         rf.write("PREDICTED EVIDENCE (matched in context)\n")
         rf.write(f"{'='*80}\n")
-        for i, (interval, text) in enumerate(zip(retrieved_intervals, retrieved_texts)):
-            rf.write(f"  [{i}] chars {interval[0]:>6}-{interval[1]:>6} ({interval[1]-interval[0]:>5} chars)\n")
+        for i, (paper_id, start, end, text) in enumerate(retrieved_data):
+            rf.write(f"  [{i}] {paper_id}  chars {start:>6}-{end:>6} ({end-start:>5} chars)\n")
             rf.write(text + "\n\n")
 
         if unmatched:
             rf.write(f"\n{'='*80}\n")
             rf.write(f"UNMATCHED PREDICTIONS ({len(unmatched)} not found in context)\n")
             rf.write(f"{'='*80}\n")
-            for i, s in enumerate(unmatched):
+            for i, (paper_id, s) in enumerate(unmatched):
                 preview = s[:150].replace("\n", "\\n")
                 if len(s) > 150:
                     preview += "..."
-                rf.write(f"  [{i}] {preview}\n")
+                rf.write(f"  [{i}] {paper_id}  {preview}\n")
 
         rf.write(f"\n{'='*80}\n")
         rf.write("OVERLAP ANALYSIS\n")
         rf.write(f"{'='*80}\n")
-        for ei, (e_iv, e_text) in enumerate(zip(evidence_intervals, evidence_texts)):
+        overlap_by_paper = {}
+        for ei, (e_pid, e_start, e_end, e_text) in enumerate(evidence_data):
             overlaps = []
-            for ri, r_iv in enumerate(retrieved_intervals):
-                lo, hi = max(e_iv[0], r_iv[0]), min(e_iv[1], r_iv[1])
+            for ri, (r_pid, r_start, r_end, _) in enumerate(retrieved_data):
+                if r_pid != e_pid:
+                    continue
+                lo, hi = max(e_start, r_start), min(e_end, r_end)
                 if lo < hi:
-                    overlaps.append((ri, r_iv, hi - lo))
-            e_len = e_iv[1] - e_iv[0]
+                    overlaps.append((ri, r_start, r_end, hi - lo))
+                    overlap_by_paper[e_pid] = overlap_by_paper.get(e_pid, 0) + (hi - lo)
+            e_len = e_end - e_start
             if overlaps:
-                parts = [f"pred[{ri}] {r_iv[0]}-{r_iv[1]} overlap={ov} chars ({ov/e_len*100:.1f}%)" for ri, r_iv, ov in overlaps]
-                rf.write(f"  evidence[{ei}] {e_iv[0]}-{e_iv[1]} ({e_len} chars): {', '.join(parts)}\n")
+                parts = [f"pred[{ri}] {rs}-{re} overlap={ov} chars ({ov/e_len*100:.1f}%)" for ri, rs, re, ov in overlaps]
+                rf.write(f"  evidence[{ei}] {e_pid} {e_start}-{e_end} ({e_len} chars): {', '.join(parts)}\n")
             else:
                 preview = e_text[:80].replace("\n", "\\n")
-                rf.write(f"  evidence[{ei}] {e_iv[0]}-{e_iv[1]} ({e_len} chars): NO OVERLAP  \"{preview}...\"\n")
+                rf.write(f"  evidence[{ei}] {e_pid} {e_start}-{e_end} ({e_len} chars): NO OVERLAP  \"{preview}...\"\n")
+
+        rf.write(f"\n{'='*80}\n")
+        rf.write("PAPERS RANKED BY CHARACTER OVERLAP\n")
+        rf.write(f"{'='*80}\n")
+        all_pids = sorted(set(p for p, *_ in evidence_data) | set(p for p, *_ in retrieved_data))
+        ranked = sorted(all_pids, key=lambda p: overlap_by_paper.get(p, 0), reverse=True)
+        for rank, pid in enumerate(ranked, 1):
+            ov = overlap_by_paper.get(pid, 0)
+            rf.write(f"  {rank:>2}. {pid}  {ov} chars overlap\n")
 
     print(
         f"[{datapoint_idx}.{question_idx}] DONE {file_stem}"
