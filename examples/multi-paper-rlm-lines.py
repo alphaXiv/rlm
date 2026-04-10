@@ -21,8 +21,8 @@ from utils.evals import compute_metrics_multipaper
 load_dotenv()
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
-_DATA = os.path.join(_ROOT, "data", "generated-queries-sample.json")
-MAX_EXAMPLES = 1
+_DATA = os.path.join(_ROOT, "data", "generated-queries-train.json")
+MAX_EXAMPLES = 1000
 
 with open(_DATA) as f:
     dataset = json.load(f)
@@ -37,7 +37,6 @@ REPL tools:
 - `context`: a dictionary where keys are paper IDs and values are full paper texts.
 - `list_papers(context)` — list all paper IDs with the first 1000 characters of their content.
 - `search(text, keyword, window=300)` — keyword search. Pass `context` to search ALL papers at once (results are grouped by paper ID and title), or pass `context[paper_id]` to search a single paper. Every line in each snippet is prefixed with its line number (e.g. `L42: ...`).
-- `extract_lines(text, start_line, end_line)` — extract lines from `start_line` to `end_line` (inclusive, 1-indexed). Pass `context[paper_id]` as first arg.
 - `get_paper_abstract(context, paper_id)` — return a formatted string with the paper ID, title, and abstract for the given paper.
 - `rlm_query_batched(prompts, context_list=None)` — dispatch child agents. Each child gets the paper text you provide. Returns list of results (each a Python list of extracted strings).
 - `FINAL_VAR(variable_name)` — return your final answer.
@@ -65,7 +64,7 @@ hits2 = search(context, "<SYNONYM_OR_RELATED_TERM>", window=300)
 ```
 `list_papers()` shows each paper ID with content preview. `search(context, ...)` searches all papers at once and groups results by paper ID — use this to quickly identify which papers are relevant.
 
-*(code runs, you receive the output)*
+*(code runs, you receive the output and analyze it)*
 
 **Turn 2**: Search with additional keywords to catch papers the first search missed.
 ```repl
@@ -74,7 +73,7 @@ hits4 = search(context, "<ABBREVIATION_OR_VARIANT>", window=300)
 ```
 After this turn, compile the full list of relevant paper IDs from ALL searches so far. For targeted follow-up on a specific paper, use `search(context[paper_id], keyword)`. For wide-net questions, err on the side of including MORE papers.
 
-*(code runs, you receive the output)*
+*(code runs, you receive the output and analyze it)*
 
 **Turn 3+**: Get relevant papers and dispatch child agents via `rlm_query_batched`.
 
@@ -96,17 +95,15 @@ Then in the next turn, do the next batch of 4 (using `ids2`, `papers2`, `prompts
 
 *(code runs, you receive the output)*
 
-**Final turn**: Pair each result with its paper ID and return a list of (paper_id, evidence) tuples. Do NOT filter or verify.
+**Final turn**: Flatten all child results into a single list of evidence strings and return it. Do NOT filter or verify.
 ```repl
 evidence = []
-for paper_id, r in zip(ids1, results1):
+for r in results1:
     if isinstance(r, list):
-        for item in r:
-            evidence.append((paper_id, item))
-for paper_id, r in zip(ids2, results2):
+        evidence.extend(r)
+for r in results2:
     if isinstance(r, list):
-        for item in r:
-            evidence.append((paper_id, item))
+        evidence.extend(r)
 FINAL_VAR("evidence")
 ```
 
@@ -423,11 +420,14 @@ def process_question(
     except (ValueError, SyntaxError):
         raw = []
 
-    # Expect list of (paper_id, evidence_text) tuples
+    # Expect flat list of evidence strings; resolve paper via substring search
+    strings = [str(item) for item in raw if isinstance(item, str)]
     pairs = []
-    for item in raw:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            pairs.append((str(item[0]), str(item[1])))
+    for s in strings:
+        for paper_id, paper_text in ctx.items():
+            if s in paper_text:
+                pairs.append((paper_id, s))
+                break
 
     # Build evidence intervals: (paper_id, start, end) relative to each paper's text
     evidence_data = []  # (paper_id, start, end, text)
@@ -444,17 +444,14 @@ def process_question(
             if not found_in_any:
                 print(f"Warning: Evidence text not found in any paper: {text[:50]}...")
 
-    # Build retrieved intervals from (paper_id, text) pairs
+    # Build retrieved intervals; pairs already resolved to (paper_id, text) via substring search
     retrieved_data = []  # (paper_id, start, end, text)
-    unmatched = []
+    matched_strings = {s for _, s in pairs}
+    unmatched = [("?", s) for s in strings if s not in matched_strings]
     for pred_paper_id, s in pairs:
-        paper_text = ctx.get(pred_paper_id)
-        if paper_text is not None:
-            idx = paper_text.find(s)
-            if idx != -1:
-                retrieved_data.append((pred_paper_id, idx, idx + len(s), s))
-                continue
-        unmatched.append((pred_paper_id, s))
+        paper_text = ctx[pred_paper_id]
+        idx = paper_text.find(s)
+        retrieved_data.append((pred_paper_id, idx, idx + len(s), s))
 
     evidence_intervals_mp = [(p, s, e) for p, s, e, _ in evidence_data]
     retrieved_intervals_mp = [(p, s, e) for p, s, e, _ in retrieved_data]
