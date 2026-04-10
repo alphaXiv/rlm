@@ -30,6 +30,7 @@ dependencies = [
     "datasets",
     "transformers",
     "jinja2",
+    "rapidfuzz>=3.14.5",
 ]
 
 [project.urls]

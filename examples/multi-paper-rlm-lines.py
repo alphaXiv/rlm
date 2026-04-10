@@ -21,7 +21,7 @@ from utils.evals import compute_metrics_multipaper
 load_dotenv()
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
-_DATA = os.path.join(_ROOT, "data", "generated-queries-train.json")
+_DATA = os.path.join(_ROOT, "data", "generated-simple.json")
 MAX_EXAMPLES = 1000
 
 with open(_DATA) as f:
@@ -111,7 +111,7 @@ RULES:
 - You have a HARD LIMIT of 10 rounds total. Plan accordingly — spend 2-4 turns searching, then dispatch.
 - EXACTLY ONE ```repl block per response. Never two, never zero (unless returning final answer without code).
 - No `#` comments in REPL code.
-- For 2+ papers: ALWAYS use `rlm_query_batched`. Never extract evidence yourself.
+- ALWAYS use `rlm_query_batched` for ALL questions, even if there is only 1 paper. Never extract evidence yourself.
 - `rlm_query_batched` takes MAX 4 papers per call. Split into multiple turns of 4 if you have more papers.
 - Each prompt passed to `rlm_query_batched` MUST end with `+ get_paper_abstract(context, paper_id)`. Never pass a plain string without it.
 - For wide-net questions: dispatch ALL plausibly relevant papers (even 5+). That means multiple batches of 4 across several turns. Missing a relevant paper is far worse than including an irrelevant one (the child will just return an empty list).
@@ -420,8 +420,15 @@ def process_question(
     except (ValueError, SyntaxError):
         raw = []
 
-    # Expect flat list of evidence strings; resolve paper via substring search
-    strings = [str(item) for item in raw if isinstance(item, str)]
+    # Flatten nested lists (e.g. [[s1, s2]] -> [s1, s2]) and collect strings
+    def flatten(lst):
+        for item in lst:
+            if isinstance(item, list):
+                yield from flatten(item)
+            else:
+                yield item
+
+    strings = [str(item) for item in flatten(raw) if isinstance(item, str)]
     pairs = []
     for s in strings:
         for paper_id, paper_text in ctx.items():
