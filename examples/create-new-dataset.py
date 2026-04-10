@@ -12,7 +12,7 @@ load_dotenv()
 # ─── Configuration ────────────────────────────────────────────────────────────
 PAPER_ID = None  # Set to a specific paper ID to process only that one, e.g. "2012.14172"
 INPUT_PATH = "data/single-paper-train.json"
-OUTPUT_PATH = "data/synthetic-single-paper-train.json"
+OUTPUT_PATH = "data/synthetic-single-paper-train-rephrased.json"
 MODEL = "anthropic/claude-opus-4.6"
 REPHRASE_MODEL = "openai/gpt-4.1-mini"
 MAX_EXAMPLES = 100

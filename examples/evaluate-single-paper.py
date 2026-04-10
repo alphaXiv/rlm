@@ -19,9 +19,10 @@ from utils.evals import compute_metrics
 load_dotenv()
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
-_DATA = os.path.join(_ROOT, "data", "synthetic-single-paper-train-modified.json")
+_DATA = os.path.join(_ROOT, "data", "synthetic-single-paper-train-rephrased.json")
 MAX_EXAMPLES = 100
-RERUN_LOW_F1 = False  # When True, re-runs only the datapoints in exports/low_f1/
+RERUN_LOW_F1 = True  # When True, re-runs datapoints from exports/results/ with F1 below LOW_F1_CUTOFF
+LOW_F1_CUTOFF = 0.3
 
 with open(_DATA) as f:
     dataset = json.load(f)
@@ -378,11 +379,11 @@ def process_datapoint(idx: int, datapoint: dict, force: bool = False) -> dict | 
                 rf.write(f"  evidence[{ei}] {e_start}-{e_end} ({e_len} chars): NO OVERLAP  \"{preview}...\"\n")
 
     low_f1_path = os.path.join("exports/low_f1", f"{file_stem}.txt")
-    if metrics["f1"] >= 0.2 and os.path.exists(low_f1_path):
+    if metrics["f1"] >= 0.3 and os.path.exists(low_f1_path):
         os.remove(low_f1_path)
         print(f"[{idx}] {file_stem} improved above threshold — removed from low_f1/")
 
-    if metrics["f1"] < 0.2:
+    if metrics["f1"] < 0.3:
         with open(low_f1_path, "w") as lf:
             lf.write(f"Paper: {paper_id} — {title}\n")
             lf.write(f"Question: {q_text}\n")
@@ -416,14 +417,26 @@ def process_datapoint(idx: int, datapoint: dict, force: bool = False) -> dict | 
 
 
 def load_low_f1_stems() -> list[str]:
-    """Return file stems of all entries in exports/low_f1/."""
-    low_f1_dir = os.path.join("exports", "low_f1")
-    if not os.path.isdir(low_f1_dir):
+    """Return file stems from exports/results/ where F1 is below LOW_F1_CUTOFF."""
+    results_dir = os.path.join("exports", "results")
+    if not os.path.isdir(results_dir):
         return []
     stems = []
-    for fname in os.listdir(low_f1_dir):
-        if fname.endswith(".txt"):
-            stems.append(fname[:-4])  # strip .txt
+    f1_re = re.compile(r"F1:\s*([0-9.]+)")
+    for fname in os.listdir(results_dir):
+        if not fname.endswith(".txt"):
+            continue
+        fpath = os.path.join(results_dir, fname)
+        try:
+            with open(fpath) as f:
+                for line in f:
+                    m = f1_re.search(line)
+                    if m:
+                        if float(m.group(1)) < LOW_F1_CUTOFF:
+                            stems.append(fname[:-4])
+                        break
+        except OSError:
+            pass
     return stems
 
 

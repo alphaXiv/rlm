@@ -211,9 +211,9 @@ def main():
                     "content": (
                         "You are a precise evidence extraction assistant. "
                         "Given a paper with line-numbered text and a question, identify the line ranges "
-                        "of all snippets that directly and specifically answer the question. "
-                        "Each range should cover a snippet of sentences that both precisely answers the question and provides sufficient context. "
-                        "Return an empty list if no relevant snippets exist."
+                        "of all passages that directly and specifically answer the question. "
+                        "Each range should cover exactly one complete paragraph. "
+                        "Return an empty list if no relevant passage exists."
                     ),
                 },
                 {
