@@ -14,7 +14,8 @@ PAPER_ID = None  # Set to a specific paper ID to process only that one, e.g. "20
 INPUT_PATH = "data/single-paper-train.json"
 OUTPUT_PATH = "data/synthetic-single-paper-train.json"
 MODEL = "anthropic/claude-opus-4.6"
-MAX_EXAMPLES = 4000
+REPHRASE_MODEL = "openai/gpt-4.1-mini"
+MAX_EXAMPLES = 100
 # ──────────────────────────────────────────────────────────────────────────────
 
 client = OpenAI(
@@ -72,6 +73,36 @@ RESPONSE_FORMAT = {
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def rephrase_question(original_question: str, paper_title: str) -> str:
+    """Rephrase a multi-paper question into a single-paper focused question."""
+    response = client.chat.completions.create(
+        model=REPHRASE_MODEL,
+        max_tokens=512,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You rephrase questions that were originally asked about a collection of papers "
+                    "so that they target a single specific paper instead. "
+                    "The rephrased question should ask for the same underlying information but be "
+                    "framed as 'in this paper' or 'in this work' rather than asking about counts "
+                    "or comparisons across multiple papers. "
+                    "Return only the rephrased question, nothing else."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Paper title: {paper_title}\n\n"
+                    f"Original question (asked about multiple papers): {original_question}\n\n"
+                    f"Rephrase this question so it targets only this single paper."
+                ),
+            },
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
 def add_line_numbers(text: str) -> str:
     """Prepend line numbers to each line: 'L1: ...', 'L2: ...', ..."""
     lines = text.split("\n")
@@ -98,7 +129,7 @@ def load_done_keys(output_path: str) -> set[str]:
     keys = set()
     for item in existing:
         pid = item.get("paper", {}).get("paperId", "")
-        q = item.get("question", "")
+        q = item.get("original_question") or item.get("question", "")
         keys.add(f"{pid}::{hashlib.sha256(q.encode()).hexdigest()[:16]}")
     return keys
 
@@ -141,8 +172,19 @@ def process_datapoint(idx: int, datapoint: dict, done_keys: set[str]) -> bool:
     full_text = f"### PAPER: {title}\n{abstract_block}{text}"
     numbered_text = add_line_numbers(full_text)
 
-    print(f"[{idx}] Processing {paper_id} / {q_hash} ...", end=" ", flush=True)
+    print(f"[{idx}] Processing {paper_id} / {q_hash} ...", flush=True)
 
+    # Rephrase the question to target this single paper
+    print(f"  Rephrasing question ...", end=" ", flush=True)
+    try:
+        question = rephrase_question(question, title)
+    except Exception as e:
+        print(f"REPHRASE ERROR: {e}", flush=True)
+        return False
+    print(f"done", flush=True)
+    print(f"  Rephrased: {question}", flush=True)
+
+    print(f"  Extracting evidence ...", end=" ", flush=True)
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -153,9 +195,9 @@ def process_datapoint(idx: int, datapoint: dict, done_keys: set[str]) -> bool:
                     "content": (
                         "You are a precise evidence extraction assistant. "
                         "Given a paper with line-numbered text and a question, identify the line ranges "
-                        "of all snippets that directly and specifically answer the question. "
-                        "Each range should cover a snippet of sentences that both precisely answers the question and provides sufficient context. "
-                        "Return an empty list if no relevant snippets exist."
+                        "of all passages that directly and specifically answer the question. "
+                        "Each range should cover exactly one complete paragraph. "
+                        "Return an empty list if no relevant passage exists."
                     ),
                 },
                 {
@@ -194,6 +236,7 @@ def process_datapoint(idx: int, datapoint: dict, done_keys: set[str]) -> bool:
 
     output_item = {
         "question": question,
+        "original_question": datapoint["question"],
         "answer": datapoint.get("answer", ""),
         "paper": {
             "paperId": paper["paperId"],
