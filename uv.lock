@@ -1561,6 +1561,14 @@ wheels = [
 ]
 
 [[package]]
+name = "opendataloader-pdf"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/f3/52a8a6a42bef261478fe9a1927bfb4666ebb0663285e400380f56194c913/opendataloader_pdf-2.2.1-py3-none-any.whl", hash = "sha256:3207c8880ae8e38b28e3c31cfadaa25e1675799bdefbd5cafe8a9caaa81ce093", size = 22443857, upload-time = "2026-04-03T09:07:35.34Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2345,6 +2353,7 @@ dependencies = [
     { name = "google-genai" },
     { name = "jinja2" },
     { name = "openai" },
+    { name = "opendataloader-pdf" },
     { name = "portkey-ai" },
     { name = "pytest" },
     { name = "python-dotenv" },
@@ -2398,6 +2407,7 @@ requires-dist = [
     { name = "jinja2" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=0.73.0" },
     { name = "openai", specifier = ">=2.14.0" },
+    { name = "opendataloader-pdf", specifier = ">=2.2.1" },
     { name = "portkey-ai", specifier = ">=2.1.0" },
     { name = "prime-sandboxes", marker = "extra == 'prime'", specifier = ">=0.2.0" },
     { name = "pytest", specifier = ">=9.0.2" },
