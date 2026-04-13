@@ -1,6 +1,5 @@
 from dotenv import load_dotenv
 import ast
-import asyncio
 import hashlib
 import json
 import os
@@ -10,13 +9,11 @@ import textwrap
 import traceback
 from rlm import RLM
 from rlm.logger import RLMLogger
-from rlm.utils.parsing import ensure_think_wrapped
-from transformers import AutoTokenizer
 from utils.evals import compute_metrics
 
 load_dotenv()
 
-with open("data/qasper-train-cleaned.json") as f:
+with open("data/qasper-sft-cleaned.json") as f:
     dataset = json.load(f)
 
 SYSTEM_PROMPT = textwrap.dedent(
@@ -95,9 +92,7 @@ _OPENROUTER_INSTRUCT_SAMPLING = {
     },
 }
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-235B-A22B-Instruct-2507")
-
-os.makedirs("exports/rollouts", exist_ok=True)
+os.makedirs("exports/turns", exist_ok=True)
 os.makedirs("exports/metadata", exist_ok=True)
 
 
@@ -248,25 +243,17 @@ def process_row(row_idx: int, row: dict) -> dict | None:
 
     full_metadata = result_dict.get("metadata", {})
     iterations = full_metadata.get("iterations", [])
-    if iterations:
-        last = iterations[-1]
-        rollout = list(last["prompt"]) + [
-            {"role": "assistant", "content": ensure_think_wrapped(last["response"])}
-        ]
-    else:
-        rollout = []
+
+    for i, it in enumerate(iterations):
+        turn_data = {
+            "input_prompt": it["prompt"],
+            "output_response": it["response"],
+        }
+        turn_path = os.path.join("exports/turns", f"{file_stem}-{i}.json")
+        with open(turn_path, "w") as f:
+            json.dump(turn_data, f, indent=2, ensure_ascii=False)
 
     result_dict["metadata"] = full_metadata.get("run_metadata", {})
-
-    rollout_text = tokenizer.apply_chat_template(
-        rollout,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-
-    rollout_path = os.path.join("exports/rollouts", f"{file_stem}.txt")
-    with open(rollout_path, "w") as f:
-        f.write(rollout_text.rstrip("\n"))
 
     with open(metadata_path, "w") as f:
         json.dump(result_dict, f, indent=2, ensure_ascii=False)
@@ -281,36 +268,24 @@ def process_row(row_idx: int, row: dict) -> dict | None:
     return metrics
 
 
-async def run_row(sem: asyncio.Semaphore, row_idx: int, row: dict) -> dict | None:
-    async with sem:
-        try:
-            return await asyncio.to_thread(process_row, row_idx, row)
-        except BaseException as e:
-            global completed
-            completed += 1
-            print(f"[{row_idx}] FAILED ({completed}/{total}): {e}", flush=True)
-            traceback.print_exc()
-            sys.stderr.flush()
-            return None
-
-
-async def main():
-    global total
+def main():
+    global total, completed
     rows = dataset[:500]
     total = len(rows)
-    sem = asyncio.Semaphore(3)
+    completed = 0
 
-    print(f"Processing {total} rows with concurrency=3", flush=True)
-
-    tasks = [run_row(sem, i, row) for i, row in enumerate(rows)]
-    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    print(f"Processing {total} rows", flush=True)
 
     results = []
-    for i, r in enumerate(all_results):
-        if isinstance(r, BaseException):
-            print(f"[{i}] unhandled error: {r}", flush=True)
-        elif r is not None:
-            results.append(r)
+    for i, row in enumerate(rows):
+        try:
+            metrics = process_row(i, row)
+            if metrics is not None:
+                results.append(metrics)
+        except Exception as e:
+            completed += 1
+            print(f"[{i}] FAILED ({completed}/{total}): {e}", flush=True)
+            traceback.print_exc()
 
     if results:
         avg_p = sum(m["precision"] for m in results) / len(results)
@@ -323,9 +298,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except BaseException as e:
-        print(f"\nFATAL: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
+    main()

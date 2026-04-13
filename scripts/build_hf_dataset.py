@@ -1,11 +1,22 @@
-"""Coalesce per-turn JSON files into a single JSONL file for Hugging Face upload."""
+"""Coalesce per-turn JSON files into a single JSONL file for Hugging Face upload.
+
+Applies the Qwen 3.5 chat template so that input_prompt and output_response
+are tokenizer-formatted strings ready for SFT training.
+"""
 
 import json
+import re
 from pathlib import Path
 
-TURNS_DIR = Path("exports/turns")
+from transformers import AutoTokenizer
+
+TURNS_DIR = Path("exports/filtered_turns")
 DATASETS_DIR = Path("exports/datasets")
 OUTPUT_FILE = DATASETS_DIR / "hf_dataset.jsonl"
+
+THINK_RE = re.compile(r"^<think(?:ing)?>\s*</think(?:ing)?>\s*", re.DOTALL)
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-397B-A17B")
 
 
 def main() -> None:
@@ -18,10 +29,20 @@ def main() -> None:
     with open(OUTPUT_FILE, "w") as out:
         for f in turn_files:
             data = json.loads(f.read_text())
+
+            input_text = tokenizer.apply_chat_template(
+                data["input_prompt"],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+
+            output_response = THINK_RE.sub("", data["output_response"]) + "<|im_end|>"
+
             row = {
                 "id": f.stem,
-                "input_prompt": data["input_prompt"],
-                "output_response": data["output_response"],
+                "input_prompt": input_text,
+                "output_response": output_response,
             }
             out.write(json.dumps(row) + "\n")
 

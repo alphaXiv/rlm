@@ -38,7 +38,7 @@ quickstart: install
 	uv run python -m examples.quickstart
 
 eval: install
-  	uv run python -m examples.eval
+	uv run python -m examples.eval
 
 docker-repl: install
 	uv run python -m examples.docker_repl_example
